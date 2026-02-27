@@ -1,14 +1,39 @@
-"""Main entry point: process articles from a WeChat public account."""
+"""
+Feeding Agent - WeChat public account article analyzer for quant investing.
+
+Usage:
+  # Subscribe a new account by article URL
+  python run.py subscribe --url https://mp.weixin.qq.com/s/xxx
+
+  # Process recent articles for one account (by name or MP ID)
+  python run.py process --name QuantML --days 7
+  python run.py process --mp-id MP_WXS_3863007345
+
+  # Process ALL subscribed accounts
+  python run.py process --all --days 7
+
+  # List all subscribed accounts
+  python run.py list
+
+  # Subscribe + immediately process
+  python run.py subscribe --url https://mp.weixin.qq.com/s/xxx --process --days 7
+
+  # Disable DingTalk push
+  python run.py process --name QuantML --no-dingtalk
+"""
 
 import sys
 import os
 import argparse
 import time
+import re
+import subprocess
+import requests
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
-from core.fetcher import fetch_articles, ensure_content, Article
+from core.fetcher import fetch_articles, ensure_content, Article, _get_token, _auth_headers
 from core.parser import parse_html
 from core.classifier import classify
 from core.analyzer import analyze, format_summary_markdown, format_dingtalk_message
@@ -16,47 +41,200 @@ from core.reporter import save_article_results, push_to_dingtalk, generate_batch
 from core.notifier import send_dingtalk
 
 
-def process_article(article: Article) -> dict:
-    """Process a single article through the full pipeline."""
-    print(f"\n{'='*60}")
-    print(f"Processing: {article.title}")
-    print(f"Date: {article.date_str}, URL: {article.url}")
+# ── Helpers ──────────────────────────────────────────────────────
 
-    # Step 1: Ensure content
-    article = ensure_content(article)
-
-    # Step 2: Parse
-    parsed = parse_html(article.content_html, title=article.title)
-    print(f"  Parsed: {len(parsed.text)} chars, {len(parsed.code_blocks)} code blocks, "
-          f"{len(parsed.paper_links)} papers, {len(parsed.github_links)} github links")
-
-    # Step 3: Classify
-    classification = classify(parsed)
-    print(f"  Classification: Level={classification.level}, "
-          f"Category={classification.category}, Relevance={classification.relevance:.2f}")
-    print(f"  Reason: {classification.reason}")
-
-    # Step 4: Analyze
-    analysis = analyze(parsed, classification, date_str=article.date_str, url=article.url)
-
-    # Step 5: Save results
-    backtest = None
-    extra_files = {}
-
-    save_article_results(article, analysis, backtest, extra_files)
-
-    return {
-        "article": article,
-        "parsed": parsed,
-        "classification": classification,
-        "analysis": analysis,
-        "backtest": backtest,
-    }
+def _api(method, path, **kwargs):
+    """Call we-mp-rss API with auth."""
+    headers = _auth_headers()
+    url = f"{config.WERSS_BASE_URL}{config.WERSS_API_PREFIX}{path}"
+    resp = getattr(requests, method)(url, headers=headers, **kwargs)
+    return resp.json()
 
 
-def process_mp(mp_id: str, days_back: int = 7, push_dingtalk: bool = True):
-    """Process all recent articles from a public account."""
-    print(f"Fetching articles for mp_id={mp_id}, last {days_back} days...")
+def _extract_account_info(article_url: str) -> dict:
+    """Extract public account info from a WeChat article URL via curl."""
+    cmd = [
+        "curl", "-s", "-L",
+        "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "-H", "Referer: https://mp.weixin.qq.com/",
+        article_url,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    html = result.stdout
+
+    def _find(pattern):
+        m = re.search(pattern, html)
+        return m.group(1).strip() if m else ""
+
+    name = _find(r'var\s+nickname\s*=\s*htmlDecode\("([^"]+)"\)')
+    if not name:
+        name = _find(r'nickname\s*=\s*"([^"]+)"')
+    if not name:
+        name = _find(r'rich_media_meta_nickname[^>]*>\s*(.+?)\s*<')
+
+    biz = _find(r'__biz=([A-Za-z0-9=]+)')
+    avatar = _find(r'var\s+hd_head_img\s*=\s*"([^"]+)"')
+
+    return {"name": name, "biz": biz, "avatar": avatar, "url": article_url}
+
+
+def _lookup_mp(name: str = None, mp_id: str = None) -> dict:
+    """Find a subscribed account by name or MP ID. Returns dict with id, mp_name."""
+    data = _api("get", "/mps", params={"limit": 100})
+    mps = data.get("data", {}).get("list", [])
+    for mp in mps:
+        if mp_id and mp["id"] == mp_id:
+            return mp
+        if name and name.lower() in mp["mp_name"].lower():
+            return mp
+    return {}
+
+
+def _list_all_mps() -> list[dict]:
+    """List all subscribed accounts."""
+    data = _api("get", "/mps", params={"limit": 100})
+    return data.get("data", {}).get("list", [])
+
+
+def _wait_for_articles(mp_id: str, timeout: int = 30):
+    """Wait for background article fetching to finish."""
+    for _ in range(timeout // 5):
+        time.sleep(5)
+        data = _api("get", "/articles", params={"mp_id": mp_id, "limit": 5})
+        total = data.get("data", {}).get("total", 0)
+        if total > 0:
+            return total
+    return 0
+
+
+# ── Commands ─────────────────────────────────────────────────────
+
+def cmd_subscribe(args):
+    """Subscribe a new public account from an article URL."""
+    print(f"Extracting account info from: {args.url}")
+    info = _extract_account_info(args.url)
+
+    if not info["biz"]:
+        print("ERROR: Could not extract account biz ID from the article.")
+        return None
+
+    name = info["name"] or args.name or "Unknown"
+    print(f"Account: {name} (biz={info['biz']})")
+
+    # Check if already subscribed
+    existing = _lookup_mp(name=name)
+    if existing:
+        print(f"Already subscribed: {existing['mp_name']} (id={existing['id']})")
+        mp_id = existing["id"]
+    else:
+        # Add to we-mp-rss
+        resp = _api("post", "/mps", json={
+            "mp_name": name,
+            "mp_id": info["biz"],
+            "mp_cover": "",
+            "avatar": info["avatar"] or "",
+            "mp_intro": f"{name}",
+        })
+        if resp.get("code") != 0:
+            print(f"ERROR: Failed to subscribe: {resp}")
+            return None
+        mp_id = resp["data"]["id"]
+        print(f"Subscribed! MP ID: {mp_id}")
+
+        # Wait for initial article fetch
+        print("Waiting for articles to be fetched...")
+        total = _wait_for_articles(mp_id)
+        print(f"Initial fetch: {total} articles")
+
+        # Trigger more pages
+        time.sleep(3)
+        _api("get", f"/mps/update/{mp_id}", params={"start_page": 0, "end_page": 3})
+        print("Triggered extended article fetch (pages 0-3)...")
+        time.sleep(15)
+
+    # Show article count
+    data = _api("get", "/articles", params={"mp_id": mp_id, "limit": 1})
+    total = data.get("data", {}).get("total", 0)
+    print(f"Total articles available: {total}")
+
+    # Process if requested
+    if args.process:
+        return cmd_process_mp(mp_id, args.days, not args.no_dingtalk)
+
+    return mp_id
+
+
+def cmd_list(args):
+    """List all subscribed accounts."""
+    mps = _list_all_mps()
+    if not mps:
+        print("No subscribed accounts.")
+        return
+
+    print(f"{'ID':<25} {'Name':<20} {'Status':<8} {'Created'}")
+    print("-" * 80)
+    for mp in mps:
+        print(f"{mp['id']:<25} {mp['mp_name']:<20} {'Active' if mp['status'] == 1 else 'Off':<8} {mp['created_at'][:10]}")
+
+
+def cmd_process(args):
+    """Process articles for one or all accounts."""
+    os.makedirs(config.RESULTS_DIR, exist_ok=True)
+    push = not args.no_dingtalk
+
+    if args.all:
+        # Process all subscribed accounts
+        mps = _list_all_mps()
+        all_results = []
+        for mp in mps:
+            if mp["status"] != 1:
+                continue
+            print(f"\n{'#'*60}")
+            print(f"# Account: {mp['mp_name']}")
+            print(f"{'#'*60}")
+            results = cmd_process_mp(mp["id"], args.days, push, mp_name=mp["mp_name"])
+            if results:
+                all_results.extend(results)
+
+        if all_results and push:
+            summary = generate_batch_summary(all_results)
+            summary_path = os.path.join(config.RESULTS_DIR, "weekly_summary.md")
+            with open(summary_path, "w") as f:
+                f.write(summary)
+            # Push combined summary
+            level_a = sum(1 for a, _ in all_results if a.level == "A")
+            level_b = sum(1 for a, _ in all_results if a.level == "B")
+            send_dingtalk("Weekly Summary", (
+                f"### 📊 Weekly Article Summary\n\n"
+                f"- Accounts: {len(mps)}\n"
+                f"- Total: {len(all_results)} articles\n"
+                f"- Level A: {level_a} | Level B: {level_b}\n"
+            ))
+        return
+
+    # Single account
+    mp = None
+    if args.mp_id:
+        mp = _lookup_mp(mp_id=args.mp_id)
+    elif args.name:
+        mp = _lookup_mp(name=args.name)
+    elif args.url:
+        # Extract from article URL
+        info = _extract_account_info(args.url)
+        if info["name"]:
+            mp = _lookup_mp(name=info["name"])
+
+    if not mp:
+        print("ERROR: Account not found. Use 'list' to see subscribed accounts, or 'subscribe' to add one.")
+        return
+
+    print(f"Processing: {mp['mp_name']} ({mp['id']})")
+    cmd_process_mp(mp["id"], args.days, push, mp_name=mp["mp_name"])
+
+
+def cmd_process_mp(mp_id: str, days_back: int, push_dingtalk: bool, mp_name: str = "") -> list:
+    """Core processing logic for a single account."""
+    print(f"Fetching articles for {mp_name or mp_id}, last {days_back} days...")
     articles = fetch_articles(mp_id, limit=30, days_back=days_back)
     print(f"Found {len(articles)} articles")
 
@@ -67,44 +245,106 @@ def process_mp(mp_id: str, days_back: int = 7, push_dingtalk: bool = True):
         backtest = result["backtest"]
         results.append((analysis, backtest))
 
-        # Push to DingTalk for Level A and B articles
         if push_dingtalk and analysis.level in ("A", "B"):
             print(f"  Pushing to DingTalk...")
             push_to_dingtalk(analysis, backtest)
-            time.sleep(2)  # Rate limit
+            time.sleep(2)
 
-    # Generate batch summary
     if results:
         summary = generate_batch_summary(results)
-        summary_path = os.path.join(config.RESULTS_DIR, "weekly_summary.md")
+        summary_path = os.path.join(config.RESULTS_DIR,
+                                    f"summary_{mp_name or mp_id}.md")
         with open(summary_path, "w") as f:
             f.write(summary)
-        print(f"\nBatch summary saved to: {summary_path}")
-
-        # Push batch summary to DingTalk
-        if push_dingtalk:
-            level_a = sum(1 for a, _ in results if a.level == "A")
-            level_b = sum(1 for a, _ in results if a.level == "B")
-            batch_msg = (
-                f"### 📊 Weekly Article Summary\n\n"
-                f"- Total: {len(results)} articles\n"
-                f"- Level A (Implementable): {level_a}\n"
-                f"- Level B (Summary): {level_b}\n"
-            )
-            send_dingtalk("Weekly Summary", batch_msg)
+        print(f"\nSummary saved: {summary_path}")
 
     return results
 
 
+def process_article(article: Article) -> dict:
+    """Process a single article through the full pipeline."""
+    print(f"\n{'='*60}")
+    print(f"Processing: {article.title}")
+    print(f"Date: {article.date_str}, URL: {article.url}")
+
+    article = ensure_content(article)
+
+    parsed = parse_html(article.content_html, title=article.title)
+    print(f"  Parsed: {len(parsed.text)} chars, {len(parsed.code_blocks)} code blocks, "
+          f"{len(parsed.paper_links)} papers, {len(parsed.github_links)} github links")
+
+    classification = classify(parsed)
+    print(f"  Classification: Level={classification.level}, "
+          f"Category={classification.category}, Relevance={classification.relevance:.2f}")
+    print(f"  Reason: {classification.reason}")
+
+    analysis = analyze(parsed, classification, date_str=article.date_str, url=article.url)
+
+    backtest = None
+    save_article_results(article, analysis, backtest)
+
+    return {
+        "article": article,
+        "parsed": parsed,
+        "classification": classification,
+        "analysis": analysis,
+        "backtest": backtest,
+    }
+
+
+# ── CLI ──────────────────────────────────────────────────────────
+
 def main():
-    parser = argparse.ArgumentParser(description="Feeding Agent - WeChat article analyzer")
-    parser.add_argument("--mp-id", default="MP_WXS_3863007345", help="Public account MP ID")
-    parser.add_argument("--days", type=int, default=7, help="Days back to fetch")
-    parser.add_argument("--no-dingtalk", action="store_true", help="Skip DingTalk notifications")
+    parser = argparse.ArgumentParser(
+        description="Feeding Agent - WeChat quant article analyzer",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s subscribe --url https://mp.weixin.qq.com/s/xxx
+  %(prog)s subscribe --url https://mp.weixin.qq.com/s/xxx --process --days 7
+  %(prog)s process --name QuantML --days 7
+  %(prog)s process --mp-id MP_WXS_3863007345
+  %(prog)s process --all --days 7
+  %(prog)s list
+        """,
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Command to run")
+
+    # subscribe
+    sub = subparsers.add_parser("subscribe", help="Subscribe a new public account")
+    sub.add_argument("--url", required=True, help="WeChat article URL from the account")
+    sub.add_argument("--name", default="", help="Override account name")
+    sub.add_argument("--process", action="store_true", help="Also process recent articles")
+    sub.add_argument("--days", type=int, default=7, help="Days back to fetch (with --process)")
+    sub.add_argument("--no-dingtalk", action="store_true", help="Skip DingTalk push")
+
+    # process
+    proc = subparsers.add_parser("process", help="Process articles from subscribed accounts")
+    group = proc.add_mutually_exclusive_group(required=True)
+    group.add_argument("--name", help="Account name (fuzzy match)")
+    group.add_argument("--mp-id", help="Account MP ID (exact)")
+    group.add_argument("--url", help="Article URL (to identify account)")
+    group.add_argument("--all", action="store_true", help="Process ALL subscribed accounts")
+    proc.add_argument("--days", type=int, default=7, help="Days back to fetch")
+    proc.add_argument("--no-dingtalk", action="store_true", help="Skip DingTalk push")
+
+    # list
+    subparsers.add_parser("list", help="List all subscribed accounts")
+
     args = parser.parse_args()
 
+    if not args.command:
+        parser.print_help()
+        return
+
     os.makedirs(config.RESULTS_DIR, exist_ok=True)
-    process_mp(args.mp_id, days_back=args.days, push_dingtalk=not args.no_dingtalk)
+
+    if args.command == "subscribe":
+        cmd_subscribe(args)
+    elif args.command == "process":
+        cmd_process(args)
+    elif args.command == "list":
+        cmd_list(args)
 
 
 if __name__ == "__main__":
