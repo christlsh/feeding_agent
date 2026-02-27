@@ -1,0 +1,16 @@
+[Unit]
+Description=Feeding Agent - WeChat article auto-analyzer
+After=network.target
+
+[Service]
+Type=simple
+User=sihang
+WorkingDirectory=/home/sihang/Valerie/feeding_agent
+ExecStart=/home/sihang/anaconda3/bin/python run.py watch --interval 60 --days 3
+Restart=on-failure
+RestartSec=30
+StandardOutput=append:/home/sihang/Valerie/feeding_agent/logs/watch.log
+StandardError=append:/home/sihang/Valerie/feeding_agent/logs/watch.log
+
+[Install]
+WantedBy=multi-user.target
