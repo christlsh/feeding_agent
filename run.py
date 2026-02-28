@@ -24,6 +24,13 @@ Usage:
 
   # Disable DingTalk push
   python run.py process --name QuantML --no-dingtalk
+
+  # XHS (Xiaohongshu) commands
+  python run.py xhs-subscribe --user https://www.xiaohongshu.com/user/profile/xxx
+  python run.py xhs-subscribe --keyword "量化交易"
+  python run.py xhs-list
+  python run.py xhs-process --days 7
+  python run.py xhs-process --search "因子挖掘" --limit 10
 """
 
 import sys
@@ -46,6 +53,16 @@ from core.classifier import classify
 from core.analyzer import analyze, format_summary_markdown, format_dingtalk_message
 from core.reporter import save_article_results, push_to_dingtalk, generate_batch_summary
 from core.notifier import send_dingtalk
+from core.xhs_fetcher import (
+    subscribe_user as xhs_subscribe_user,
+    unsubscribe_user as xhs_unsubscribe_user,
+    add_keyword as xhs_add_keyword,
+    remove_keyword as xhs_remove_keyword,
+    list_subscriptions as xhs_list_subscriptions,
+    fetch_user_notes as xhs_fetch_user_notes,
+    search_notes as xhs_search_notes,
+    fetch_all_subscribed as xhs_fetch_all,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -371,6 +388,31 @@ def cmd_watch(args):
         except Exception as e:
             log.error(f"Error during check: {e}")
 
+        # Check XHS subscriptions
+        try:
+            xhs_subs = xhs_list_subscriptions()
+            if xhs_subs.get("users") or xhs_subs.get("keywords"):
+                log.info("Checking XHS subscriptions...")
+                xhs_articles = xhs_fetch_all(days_back=days_back)
+                if xhs_articles:
+                    processed = _load_processed()
+                    xhs_articles = [a for a in xhs_articles if a.id not in processed]
+                    if xhs_articles:
+                        log.info(f"Processing {len(xhs_articles)} new XHS notes...")
+                        for article in sorted(xhs_articles, key=lambda a: a.publish_time):
+                            try:
+                                result = process_article(article)
+                                _mark_processed(article.id)
+                                if push and result["analysis"].level in ("A", "B"):
+                                    push_to_dingtalk(result["analysis"], result["backtest"])
+                                    time.sleep(2)
+                            except Exception as e:
+                                log.error(f"Error processing XHS note {article.title}: {e}")
+                    else:
+                        log.info("No new XHS notes")
+        except Exception as e:
+            log.error(f"Error during XHS check: {e}")
+
         # Periodically trigger article sync
         try:
             _trigger_sync_all()
@@ -391,6 +433,91 @@ def _trigger_sync_all():
             _api("get", f"/mps/update/{mp['id']}", params={"start_page": 0, "end_page": 1})
         except Exception:
             pass  # rate-limited is fine
+
+
+# ── XHS Commands ─────────────────────────────────────────────────
+
+
+def cmd_xhs_subscribe(args):
+    """Subscribe to an XHS user or add a search keyword."""
+    if args.user:
+        entry = xhs_subscribe_user(args.user, nickname=getattr(args, "nickname", "") or "")
+        print(f"Subscribed to XHS user: {entry['nickname']} ({entry['user_id']})")
+    elif args.keyword:
+        entry = xhs_add_keyword(args.keyword)
+        print(f"Added XHS keyword: {entry['keyword']}")
+    else:
+        print("ERROR: Provide --user <id_or_url> or --keyword <keyword>")
+
+
+def cmd_xhs_list(args):
+    """List XHS subscriptions."""
+    subs = xhs_list_subscriptions()
+    users = subs.get("users", [])
+    keywords = subs.get("keywords", [])
+
+    if not users and not keywords:
+        print("No XHS subscriptions.")
+        return
+
+    if users:
+        print("XHS Users:")
+        for i, u in enumerate(users, 1):
+            print(f"  {i}. {u['nickname']} - {u['url']} (since {u['added_at']})")
+
+    if keywords:
+        print("XHS Keywords:")
+        for i, k in enumerate(keywords, 1):
+            print(f"  {i}. {k['keyword']} (since {k['added_at']})")
+
+
+def cmd_xhs_process(args):
+    """Process XHS notes from subscriptions or search."""
+    os.makedirs(config.RESULTS_DIR, exist_ok=True)
+    push = not args.no_dingtalk
+    new_only = getattr(args, "new_only", True)
+
+    if args.search:
+        log.info(f"Searching XHS for: {args.search}")
+        articles = xhs_search_notes(args.search, max_notes=args.limit)
+    elif args.user:
+        log.info(f"Fetching notes for XHS user: {args.user}")
+        articles = xhs_fetch_user_notes(args.user, max_notes=args.limit)
+    else:
+        log.info("Fetching all XHS subscriptions...")
+        articles = xhs_fetch_all(days_back=args.days)
+
+    if new_only:
+        processed = _load_processed()
+        before = len(articles)
+        articles = [a for a in articles if a.id not in processed]
+        log.info(f"New XHS notes: {len(articles)} (skipped {before - len(articles)})")
+
+    if not articles:
+        print("No new XHS notes to process.")
+        return []
+
+    results = []
+    for article in sorted(articles, key=lambda a: a.publish_time):
+        result = process_article(article)
+        analysis = result["analysis"]
+        backtest = result["backtest"]
+        results.append((analysis, backtest))
+        _mark_processed(article.id)
+
+        if push and analysis.level in ("A", "B"):
+            log.info("  Pushing to DingTalk...")
+            push_to_dingtalk(analysis, backtest)
+            time.sleep(2)
+
+    if results:
+        summary = generate_batch_summary(results)
+        summary_path = os.path.join(config.RESULTS_DIR, "summary_xhs.md")
+        with open(summary_path, "w") as f:
+            f.write(summary)
+        log.info(f"XHS summary saved: {summary_path}")
+
+    return results
 
 
 # ── CLI ──────────────────────────────────────────────────────────
@@ -442,6 +569,27 @@ Examples:
     # list
     subparsers.add_parser("list", help="List all subscribed accounts")
 
+    # xhs-subscribe
+    xhs_sub = subparsers.add_parser("xhs-subscribe", help="Subscribe to XHS user or keyword")
+    xhs_sub_group = xhs_sub.add_mutually_exclusive_group(required=True)
+    xhs_sub_group.add_argument("--user", help="XHS user ID or profile URL")
+    xhs_sub_group.add_argument("--keyword", help="Search keyword to monitor")
+    xhs_sub.add_argument("--nickname", default="", help="Nickname for the user")
+
+    # xhs-list
+    subparsers.add_parser("xhs-list", help="List XHS subscriptions")
+
+    # xhs-process
+    xhs_proc = subparsers.add_parser("xhs-process", help="Process XHS notes")
+    xhs_proc_group = xhs_proc.add_mutually_exclusive_group()
+    xhs_proc_group.add_argument("--search", help="Search keyword (one-off)")
+    xhs_proc_group.add_argument("--user", help="Specific user ID")
+    xhs_proc.add_argument("--days", type=int, default=7, help="Days back")
+    xhs_proc.add_argument("--limit", type=int, default=20, help="Max notes to fetch")
+    xhs_proc.add_argument("--new-only", action="store_true", default=True,
+                          help="Skip already-processed notes")
+    xhs_proc.add_argument("--no-dingtalk", action="store_true")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -458,6 +606,12 @@ Examples:
         cmd_watch(args)
     elif args.command == "list":
         cmd_list(args)
+    elif args.command == "xhs-subscribe":
+        cmd_xhs_subscribe(args)
+    elif args.command == "xhs-list":
+        cmd_xhs_list(args)
+    elif args.command == "xhs-process":
+        cmd_xhs_process(args)
 
 
 if __name__ == "__main__":
