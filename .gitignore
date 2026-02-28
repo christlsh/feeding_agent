@@ -7,3 +7,4 @@ __pycache__/
 .telegram_chat_ids.json
 .xhs_subscriptions.json
 logs/
+stealth.min.js
