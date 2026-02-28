@@ -881,38 +881,66 @@ _last_health_ok = True
 
 
 async def _health_check_job(context: ContextTypes.DEFAULT_TYPE):
-    """Periodic job: check we-mp-rss health and notify on Telegram if issues found."""
+    """Periodic job: check we-mp-rss and XHS health, notify on Telegram if issues."""
     global _last_health_ok
 
-    log.info("Running WeRSS health check...")
-    health = _check_werss_health()
+    log.info("Running health check...")
 
-    if health["service_ok"] and health["fetch_ok"]:
+    # --- WeRSS check ---
+    health = _check_werss_health()
+    werss_ok = health["service_ok"] and health["fetch_ok"]
+
+    # --- XHS check ---
+    xhs_ok = True
+    xhs_error = ""
+    if config.XHS_COOKIE:
+        try:
+            from core.xhs_fetcher import check_health as xhs_check_health
+            xhs_health = xhs_check_health()
+            xhs_ok = xhs_health["ok"]
+            xhs_error = xhs_health.get("error", "")
+        except Exception as e:
+            xhs_ok = False
+            xhs_error = str(e)
+
+    all_ok = werss_ok and xhs_ok
+
+    if all_ok:
         if not _last_health_ok:
-            log.info("WeRSS health recovered")
+            log.info("All services recovered")
             for chat_id in _active_chat_ids:
                 try:
                     await context.bot.send_message(
                         chat_id=chat_id,
-                        text="✅ WeRSS 服务已恢复正常，微信公众号文章抓取正常。",
+                        text="✅ 所有服务已恢复正常 (WeRSS + XHS)。",
                     )
                 except Exception as e:
                     log.error(f"Failed to send recovery notice to {chat_id}: {e}")
         _last_health_ok = True
-        log.info("WeRSS health OK")
+        log.info("Health check OK")
         return
 
     _last_health_ok = False
-    log.warning(f"WeRSS health issue: {health['error']}")
 
-    alert = (
-        "⚠️ WeRSS 微信公众号服务异常\n\n"
-        f"服务连接: {'✅ 正常' if health['service_ok'] else '❌ 失败'}\n"
-        f"文章抓取: {'✅ 正常' if health['fetch_ok'] else '❌ 失败'}\n"
-    )
-    if health["error"]:
-        alert += f"\n错误信息: {health['error']}\n"
-    alert += f"\n👉 请检查 we-mp-rss 后台: {config.WERSS_BASE_URL}\n可能需要重新扫码登录微信。"
+    # Build alert message
+    alert_parts = ["⚠️ 服务健康检查异常\n"]
+
+    if not werss_ok:
+        alert_parts.append(
+            f"WeRSS: {'✅' if health['service_ok'] else '❌'} 连接 / "
+            f"{'✅' if health['fetch_ok'] else '❌'} 抓取"
+        )
+        if health["error"]:
+            alert_parts.append(f"  → {health['error']}")
+        alert_parts.append(f"  👉 检查: {config.WERSS_BASE_URL}")
+
+    if not xhs_ok:
+        alert_parts.append(f"XHS: ❌ {xhs_error}")
+        if "cookie" in xhs_error.lower() or "expired" in xhs_error.lower():
+            alert_parts.append("  👉 请更新 XHS_COOKIE 环境变量")
+
+    alert = "\n".join(alert_parts)
+    log.warning(f"Health issue: werss_ok={werss_ok}, xhs_ok={xhs_ok}")
 
     for chat_id in _active_chat_ids:
         try:
