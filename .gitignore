@@ -4,3 +4,5 @@ __pycache__/
 *.egg-info/
 .env
 .processed.json
+.telegram_chat_ids.json
+logs/

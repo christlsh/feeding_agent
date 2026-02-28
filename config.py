@@ -1,14 +1,27 @@
 """Central configuration for the feeding agent."""
 
+import os
+
 # we-mp-rss service
 WERSS_BASE_URL = "http://localhost:8001"
 WERSS_API_PREFIX = "/api/v1/wx"
 WERSS_USERNAME = "admin"
 WERSS_PASSWORD = "admin@123"
 
-# DingTalk notification
+# DingTalk notification (webhook for outgoing push)
 DINGTALK_WEBHOOK = "https://oapi.dingtalk.com/robot/send?access_token=3ebb601f88770eea328f4f313790303101cc58f006782e77ca71510259f0102e"
 DINGTALK_SECRET = "SEC231ce1c6e82ea7e3360bc702040936134bc90cd4d34c6e1a59a83a3a5da5e71c"
+
+# DingTalk Stream Bot (bidirectional chat, set via env or fill in directly)
+DINGTALK_APP_KEY = os.environ.get("DINGTALK_APP_KEY", "dingqzjtphfcqxcvozje")
+DINGTALK_APP_SECRET = os.environ.get("DINGTALK_APP_SECRET", "xoWiaAncXotjFUzmRN0SRr_YmeWDIyiXX2818BHX93Sb8sWWJcowpE0chwLbwDUK")
+
+# Telegram Bot
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8798729634:AAHAqqrRN1FtdZ6Xu49QbET3aQY0Ade8zgQ")
+
+# Anthropic API (Claude) — third-party proxy
+ANTHROPIC_BASE_URL = os.environ.get("ANTHROPIC_BASE_URL", "https://claudelike.online/api")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_AUTH_TOKEN", "cr_3050ca27e7cd779458bc8e0dcaad560b449d452b3c3e67c33a2a8499606d13be")
 
 # Data paths (A-share)
 DATA_ROOT = "/data/a_share/sihang"
@@ -23,7 +36,6 @@ SEC_INFO_DIR = f"{DATA_ROOT}/sec_info"
 TRADE_DAYS_PATH = f"{DATA_ROOT}/all_trade_days.npy"
 
 # Project paths
-import os
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(PROJECT_ROOT, "results")
 
