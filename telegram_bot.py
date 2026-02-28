@@ -389,6 +389,116 @@ def tool_run_command(command: str) -> str:
         return f"命令执行出错: {e}"
 
 
+# ── XHS tools (consolidated to minimize API payload) ─────────────
+
+
+def tool_xhs_manage(action: str, value: str = "") -> str:
+    """Manage XHS subscriptions: subscribe_user, add_keyword, list, remove_user, remove_keyword."""
+    from core.xhs_fetcher import (
+        subscribe_user, unsubscribe_user, add_keyword, remove_keyword,
+        list_subscriptions,
+    )
+
+    if action == "list":
+        subs = list_subscriptions()
+        users = subs.get("users", [])
+        keywords = subs.get("keywords", [])
+        if not users and not keywords:
+            return "当前没有 XHS 订阅。"
+        lines = []
+        if users:
+            lines.append("XHS 订阅用户:")
+            for i, u in enumerate(users, 1):
+                lines.append(f"  {i}. {u['nickname']} ({u['user_id'][:8]}...)")
+        if keywords:
+            lines.append("XHS 关注关键词:")
+            for i, k in enumerate(keywords, 1):
+                lines.append(f"  {i}. {k['keyword']}")
+        return "\n".join(lines)
+
+    elif action == "subscribe_user":
+        if not value:
+            return "请提供用户ID或主页URL"
+        try:
+            entry = subscribe_user(value)
+            return f"已订阅 XHS 用户: {entry['nickname']} ({entry['user_id']})"
+        except Exception as e:
+            return f"订阅失败: {e}"
+
+    elif action == "add_keyword":
+        if not value:
+            return "请提供关键词"
+        entry = add_keyword(value)
+        return f"已添加 XHS 关键词: {entry['keyword']}"
+
+    elif action == "remove_user":
+        if unsubscribe_user(value):
+            return f"已取消订阅用户: {value}"
+        return f"未找到用户: {value}"
+
+    elif action == "remove_keyword":
+        if remove_keyword(value):
+            return f"已移除关键词: {value}"
+        return f"未找到关键词: {value}"
+
+    return f"未知操作: {action}"
+
+
+def tool_xhs_process(action: str, keyword: str = "") -> str:
+    """Process XHS notes: search by keyword or process all subscriptions."""
+    from core.xhs_fetcher import search_notes, fetch_all_subscribed
+
+    run = _import_run()
+
+    if action == "search":
+        if not keyword:
+            return "请提供搜索关键词"
+        try:
+            articles = search_notes(keyword, max_notes=5)
+            if not articles:
+                return f"XHS 搜索 '{keyword}' 无结果。"
+            processed = run._load_processed()
+            articles = [a for a in articles if a.id not in processed]
+            if not articles:
+                return f"XHS 搜索 '{keyword}' 的结果都已处理过。"
+            results = []
+            for article in articles:
+                result = run.process_article(article)
+                run._mark_processed(article.id)
+                results.append(result)
+            lines = [f"XHS 搜索 '{keyword}' 处理了 {len(results)} 篇笔记:"]
+            for r in results:
+                a = r["analysis"]
+                lines.append(f"- [{a.level}] {a.title}")
+            return "\n".join(lines)
+        except Exception as e:
+            log.error(f"XHS search error: {e}\n{traceback.format_exc()}")
+            return f"XHS 搜索出错: {e}"
+
+    elif action == "process_all":
+        try:
+            articles = fetch_all_subscribed(days_back=7)
+            processed = run._load_processed()
+            articles = [a for a in articles if a.id not in processed]
+            if not articles:
+                return "没有新的 XHS 笔记需要处理。"
+            results = []
+            for article in articles:
+                result = run.process_article(article)
+                run._mark_processed(article.id)
+                results.append(result)
+            lines = [f"处理了 {len(results)} 篇 XHS 笔记:"]
+            for r in results:
+                a = r["analysis"]
+                lines.append(f"- [{a.level}] {a.title}")
+            return "\n".join(lines)
+        except Exception as e:
+            log.error(f"XHS process error: {e}\n{traceback.format_exc()}")
+            return f"XHS 处理出错: {e}"
+
+    return f"未知操作: {action}"
+
+
 # ── Tool dispatch ─────────────────────────────────────────────────
 
 TOOL_DISPATCH = {
@@ -399,12 +509,14 @@ TOOL_DISPATCH = {
     "search_results": lambda args: tool_search_results(args["keyword"]),
     "read_file": lambda args: tool_read_file(args["file_path"]),
     "run_command": lambda args: tool_run_command(args["command"]),
+    "xhs_manage": lambda args: tool_xhs_manage(args["action"], args.get("value", "")),
+    "xhs_process": lambda args: tool_xhs_process(args["action"], args.get("keyword", "")),
 }
 
 
 # ── Claude API ────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = "你是QFeeder Bot，量化研究AI助手。用中文回复。可管理公众号、分析文章、读文件、执行命令。给深度分析，解读IC/夏普。"
+SYSTEM_PROMPT = "你是QFeeder Bot，量化研究AI助手。用中文回复。可管理公众号和小红书、分析文章、读文件、执行命令。深度分析IC/夏普。"
 
 TOOLS = [
     {
@@ -460,6 +572,30 @@ TOOLS = [
             "type": "object",
             "properties": {"command": {"type": "string", "description": "shell命令"}},
             "required": ["command"],
+        },
+    },
+    {
+        "name": "xhs_manage",
+        "description": "管理小红书订阅(subscribe_user/add_keyword/list/remove_user/remove_keyword)",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "description": "操作: subscribe_user/add_keyword/list/remove_user/remove_keyword"},
+                "value": {"type": "string", "description": "用户ID/URL或关键词(list时可省略)"},
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "xhs_process",
+        "description": "处理小红书笔记(search搜索/process_all处理全部订阅)",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "description": "操作: search/process_all"},
+                "keyword": {"type": "string", "description": "搜索关键词(search时必填)"},
+            },
+            "required": ["action"],
         },
     },
 ]
@@ -567,6 +703,18 @@ def _fallback_handle(text: str) -> str | None:
     if m:
         return tool_search_results(m.group(1).strip())
 
+    # XHS fallback commands
+    if text in ("xhs列表", "xhs订阅", "小红书列表", "小红书订阅列表"):
+        return tool_xhs_manage("list")
+
+    m = re.match(r"(?:xhs订阅|小红书订阅)\s+(\S+)", text, re.IGNORECASE)
+    if m:
+        return tool_xhs_manage("subscribe_user", m.group(1))
+
+    m = re.match(r"(?:xhs搜索|小红书搜索)\s+(.+)", text, re.IGNORECASE)
+    if m:
+        return tool_xhs_process("search", m.group(1).strip())
+
     return None
 
 
@@ -589,7 +737,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # Long-running tool names that need a "please wait" message
-_LONG_RUNNING_KEYWORDS = {"订阅", "subscribe", "处理", "分析", "process", "analyze"}
+_LONG_RUNNING_KEYWORDS = {"订阅", "subscribe", "处理", "分析", "process", "analyze", "小红书", "xhs"}
 
 
 def _is_long_running(text: str) -> bool:
