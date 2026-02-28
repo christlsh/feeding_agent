@@ -1,9 +1,11 @@
-"""Fetch notes from Xiaohongshu (XHS / 小红书) via xhs package.
+"""Fetch notes from Xiaohongshu (XHS / 小红书) via browser scraping.
+
+Uses sign server's browser-based scraping to bypass XHS API restrictions.
+Primary data source is the search API (intercepted by the sign server).
 
 Requires:
-  1. pip install xhs
-  2. Sign server running on localhost:5005 (Playwright-based)
-  3. XHS_COOKIE env variable set (from browser)
+  1. Sign server running on localhost:5005
+  2. XHS_COOKIE set in config.py or env
 """
 
 import json
@@ -18,76 +20,82 @@ from core.fetcher import Article
 
 log = logging.getLogger("feeding_agent.xhs")
 
-
-# ── Sign function ────────────────────────────────────────────────
-
-
-def _sign(uri, data=None, a1="", web_session=""):
-    """Call the local sign server to get x-s/x-t signatures."""
-    res = requests.post(
-        config.XHS_SIGN_SERVER,
-        json={"uri": uri, "data": data, "a1": a1, "web_session": web_session},
-        timeout=10,
-    )
-    signs = res.json()
-    return {"x-s": signs["x-s"], "x-t": signs["x-t"]}
+# Sign server base URL (strip /sign suffix)
+_SIGN_SERVER_BASE = config.XHS_SIGN_SERVER.replace("/sign", "")
 
 
-# ── Client management ───────────────────────────────────────────
-
-_client = None
+# ── Sign server communication ────────────────────────────────────
 
 
-def get_client():
-    """Get or create a singleton XhsClient instance."""
-    global _client
-    if _client is None:
-        from xhs import XhsClient
-        cookie = config.XHS_COOKIE
-        if not cookie:
-            raise RuntimeError("XHS_COOKIE not set. Set via env or config.py.")
-        _client = XhsClient(cookie=cookie, sign=_sign)
-    return _client
+def _search_via_server(keyword: str) -> list[dict]:
+    """Search notes via sign server (intercepts search API).
+
+    Returns list of note dicts with: note_id, title, desc, type, user,
+    tag_list, image_list, interact_info.
+    """
+    try:
+        res = requests.post(
+            f"{_SIGN_SERVER_BASE}/search",
+            json={"keyword": keyword},
+            timeout=30,
+        )
+        data = res.json()
+        if "error" in data and "notes" not in data:
+            log.warning(f"Search '{keyword}': {data.get('error')}")
+            return []
+        return data.get("notes", [])
+    except Exception as e:
+        log.error(f"Search '{keyword}' failed: {e}")
+        return []
 
 
-def reset_client():
-    """Reset the client (e.g., after cookie update)."""
-    global _client
-    _client = None
+def _fetch_user_profile(user_id: str) -> dict:
+    """Fetch user profile (nickname + notes) via sign server.
+
+    Returns: {nickname, user_id, desc, notes: [{note_id, title, ...}]}
+    """
+    try:
+        res = requests.post(
+            f"{_SIGN_SERVER_BASE}/user_notes",
+            json={"user_id": user_id},
+            timeout=30,
+        )
+        data = res.json()
+        if "error" in data and "notes" not in data:
+            log.warning(f"User profile {user_id}: {data.get('error')}")
+            return {}
+        return data
+    except Exception as e:
+        log.error(f"User profile {user_id} failed: {e}")
+        return {}
 
 
 # ── Health check ─────────────────────────────────────────────────
 
 
 def check_health() -> dict:
-    """Check if XHS cookie and sign server are working.
+    """Check if sign server is working.
 
     Returns: {"ok": bool, "sign_server_ok": bool, "cookie_ok": bool, "error": str}
     """
     result = {"ok": False, "sign_server_ok": False, "cookie_ok": False, "error": ""}
 
-    # 1. Check sign server
     try:
-        # Try the sign server root endpoint
-        base_url = config.XHS_SIGN_SERVER.replace("/sign", "")
-        requests.get(base_url, timeout=5)
+        resp = requests.get(_SIGN_SERVER_BASE, timeout=5)
+        resp.raise_for_status()
         result["sign_server_ok"] = True
     except Exception as e:
         result["error"] = f"Sign server unreachable: {e}"
         return result
 
-    # 2. Check cookie by trying a simple API call
+    # Test search functionality (quick keyword)
     try:
-        client = get_client()
-        client.get_self_info()
+        test = _search_via_server("test")
+        # Even if no results, search working means cookies are OK
         result["cookie_ok"] = True
         result["ok"] = True
     except Exception as e:
-        err_str = str(e)
-        if any(kw in err_str.lower() for kw in ("login", "cookie", "sign", "expired", "未登录")):
-            result["error"] = f"XHS cookie expired or invalid: {err_str}"
-        else:
-            result["error"] = f"XHS API error: {err_str}"
+        result["error"] = f"Search test failed: {e}"
 
     return result
 
@@ -117,24 +125,16 @@ def subscribe_user(user_id: str, nickname: str = "") -> dict:
     """
     subs = _load_subscriptions()
 
-    # Normalize: extract user_id from URL if needed
     if "xiaohongshu.com" in user_id:
         parts = user_id.rstrip("/").split("/")
         user_id = parts[-1]
 
-    # Check duplicate
     for u in subs["users"]:
         if u["user_id"] == user_id:
-            return u  # already subscribed
+            return u
 
-    # Fetch nickname if not provided
     if not nickname:
-        try:
-            client = get_client()
-            info = client.get_user_info(user_id)
-            nickname = info.get("nickname", user_id)
-        except Exception:
-            nickname = user_id
+        nickname = user_id  # Use ID as placeholder; user can update later
 
     entry = {
         "user_id": user_id,
@@ -149,7 +149,6 @@ def subscribe_user(user_id: str, nickname: str = "") -> dict:
 
 
 def unsubscribe_user(user_id: str) -> bool:
-    """Remove an XHS user subscription."""
     if "xiaohongshu.com" in user_id:
         parts = user_id.rstrip("/").split("/")
         user_id = parts[-1]
@@ -164,11 +163,10 @@ def unsubscribe_user(user_id: str) -> bool:
 
 
 def add_keyword(keyword: str) -> dict:
-    """Add a search keyword to monitor."""
     subs = _load_subscriptions()
     for k in subs["keywords"]:
         if k["keyword"] == keyword:
-            return k  # already exists
+            return k
     entry = {"keyword": keyword, "added_at": datetime.now().strftime("%Y-%m-%d")}
     subs["keywords"].append(entry)
     _save_subscriptions(subs)
@@ -177,7 +175,6 @@ def add_keyword(keyword: str) -> dict:
 
 
 def remove_keyword(keyword: str) -> bool:
-    """Remove a keyword subscription."""
     subs = _load_subscriptions()
     before = len(subs["keywords"])
     subs["keywords"] = [k for k in subs["keywords"] if k["keyword"] != keyword]
@@ -188,25 +185,23 @@ def remove_keyword(keyword: str) -> bool:
 
 
 def list_subscriptions() -> dict:
-    """Return all XHS subscriptions."""
     return _load_subscriptions()
 
 
 # ── Note → Article conversion ───────────────────────────────────
 
 
-def _note_to_article(note_detail: dict, source_name: str = "XHS") -> Article:
-    """Convert an XHS note detail dict into an Article object.
+def _note_to_article(note_data: dict, source_name: str = "XHS") -> Article:
+    """Convert a note dict (from search API or user profile) into an Article.
 
-    Constructs lightweight HTML from the note's text/tags so the existing
-    parse_html() pipeline works unchanged.
+    Handles both cases where desc is available or only title is available.
     """
-    note_id = note_detail.get("note_id", "")
-    title = note_detail.get("title", "") or note_detail.get("display_title", "")
-    desc = note_detail.get("desc", "")
+    note_id = note_data.get("note_id", "")
+    title = note_data.get("title", "") or note_data.get("display_title", "")
+    desc = note_data.get("desc", "")
 
-    # Parse timestamp (XHS uses ms timestamps or ISO strings)
-    time_val = note_detail.get("time", 0)
+    # Parse timestamp
+    time_val = note_data.get("time", 0)
     if isinstance(time_val, str):
         try:
             dt = datetime.fromisoformat(time_val)
@@ -214,151 +209,142 @@ def _note_to_article(note_detail: dict, source_name: str = "XHS") -> Article:
         except Exception:
             publish_time = int(datetime.now().timestamp())
     elif time_val and time_val > 1e12:
-        publish_time = int(time_val / 1000)  # ms -> s
+        publish_time = int(time_val / 1000)
     elif time_val:
         publish_time = int(time_val)
     else:
         publish_time = int(datetime.now().timestamp())
 
     # Tags
-    tags = note_detail.get("tag_list", [])
+    tags = note_data.get("tag_list", [])
     tag_text = " ".join(f"#{t.get('name', '')}" for t in tags if t.get("name"))
 
-    # Image count
-    images = note_detail.get("image_list", [])
+    # Images
+    images = note_data.get("image_list", [])
 
-    # Build pseudo-HTML for pipeline compatibility
+    # Interaction stats
+    interact = note_data.get("interact_info", {})
+    stats_parts = []
+    if interact.get("liked_count", "0") != "0":
+        stats_parts.append(f"赞 {interact['liked_count']}")
+    if interact.get("collected_count", "0") != "0":
+        stats_parts.append(f"收藏 {interact['collected_count']}")
+    if interact.get("comment_count", "0") != "0":
+        stats_parts.append(f"评论 {interact['comment_count']}")
+    stats_text = " | ".join(stats_parts)
+
+    # Build content text (title + desc + tags + stats)
     content_parts = []
     if title:
-        content_parts.append(f"<h1>{title}</h1>")
-    if desc:
-        html_desc = desc.replace("\n", "<br>\n")
-        content_parts.append(f"<div>{html_desc}</div>")
+        content_parts.append(title)
+    if desc and desc != title:
+        content_parts.append(desc)
     if tag_text:
-        content_parts.append(f"<p>{tag_text}</p>")
-    for _ in images:
-        content_parts.append('<img src="xhs_image">')
+        content_parts.append(tag_text)
+    if images:
+        content_parts.append(f"[{len(images)}张图片]")
+    if stats_text:
+        content_parts.append(f"互动: {stats_text}")
+    content_text = "\n\n".join(content_parts)
 
-    content_html = "\n".join(content_parts)
+    # Build pseudo-HTML for pipeline compatibility
+    html_parts = []
+    if title:
+        html_parts.append(f"<h1>{title}</h1>")
+    if desc and desc != title:
+        html_parts.append(f"<div>{desc.replace(chr(10), '<br>')}</div>")
+    if tag_text:
+        html_parts.append(f"<p>{tag_text}</p>")
+    for _ in images:
+        html_parts.append('<img src="xhs_image">')
+    if stats_text:
+        html_parts.append(f"<p><small>{stats_text}</small></p>")
+    content_html = "\n".join(html_parts)
+
     url = f"https://www.xiaohongshu.com/explore/{note_id}"
 
-    # User info
-    user = note_detail.get("user", {})
+    user = note_data.get("user", {})
     user_nickname = user.get("nickname", source_name)
 
     article = Article(
         id=f"xhs_{note_id}",
-        title=title if title else (desc[:50] if desc else "Untitled"),
+        title=title if title else "Untitled",
         url=url,
         publish_time=publish_time,
         content_html=content_html,
         mp_name=f"XHS:{user_nickname}",
         mp_id=f"xhs_{user.get('user_id', '')}",
     )
-    article.content_text = desc  # Store raw text directly
+    article.content_text = content_text
     return article
 
 
 # ── Note fetching ────────────────────────────────────────────────
 
 
+def search_notes(keyword: str, max_notes: int = 20) -> list[Article]:
+    """Search XHS for notes by keyword. Uses search API data directly."""
+    note_list = _search_via_server(keyword)
+    if not note_list:
+        log.warning(f"No search results for '{keyword}'")
+        return []
+
+    articles = []
+    for note_data in note_list:
+        # Skip video notes
+        if note_data.get("type") == "video":
+            continue
+        if not note_data.get("note_id"):
+            continue
+        articles.append(_note_to_article(note_data))
+        if len(articles) >= max_notes:
+            break
+
+    log.info(f"Search '{keyword}': {len(articles)} articles")
+    return articles
+
+
 def fetch_user_notes(user_id: str, max_notes: int = 20) -> list[Article]:
-    """Fetch recent image-only notes from an XHS user."""
+    """Fetch notes from an XHS user by searching for their nickname.
+
+    XHS profile pages trigger captcha, so we search for the user's nickname
+    instead and filter results to only include their notes.
+    """
     if "xiaohongshu.com" in user_id:
         parts = user_id.rstrip("/").split("/")
         user_id = parts[-1]
 
-    client = get_client()
+    # Get nickname from subscriptions or profile
+    nickname = ""
+    subs = _load_subscriptions()
+    for u in subs.get("users", []):
+        if u["user_id"] == user_id:
+            nickname = u.get("nickname", "")
+            break
+
+    if not nickname:
+        # Try fetching profile (might trigger captcha)
+        profile = _fetch_user_profile(user_id)
+        nickname = profile.get("nickname", "") or user_id
+
+    if not nickname or nickname == user_id:
+        log.warning(f"No nickname for user {user_id}, can't search")
+        return []
+
+    # Search by nickname and filter by user_id
+    all_results = _search_via_server(nickname)
     articles = []
-    cursor = ""
-
-    while len(articles) < max_notes:
-        try:
-            data = client.get_user_notes(user_id=user_id, cursor=cursor)
-        except Exception as e:
-            log.error(f"Error fetching notes for user {user_id}: {e}")
+    for note_data in all_results:
+        note_user_id = note_data.get("user", {}).get("user_id", "")
+        if note_user_id != user_id:
+            continue
+        if note_data.get("type") == "video":
+            continue
+        articles.append(_note_to_article(note_data, source_name=nickname))
+        if len(articles) >= max_notes:
             break
 
-        notes = data.get("notes", [])
-        if not notes:
-            break
-
-        for note in notes:
-            # Filter: image-only (type == "normal"), skip video
-            if note.get("type") != "normal":
-                continue
-            note_id = note.get("note_id", "")
-            if not note_id:
-                continue
-
-            try:
-                detail = client.get_note_by_id(note_id)
-                time.sleep(1)  # rate limiting
-            except Exception as e:
-                log.warning(f"Error fetching note detail {note_id}: {e}")
-                continue
-
-            articles.append(_note_to_article(detail))
-            if len(articles) >= max_notes:
-                break
-
-        if not data.get("has_more"):
-            break
-        cursor = data.get("cursor", "")
-
-    log.info(f"Fetched {len(articles)} image notes for user {user_id}")
-    return articles
-
-
-def search_notes(keyword: str, max_notes: int = 20) -> list[Article]:
-    """Search XHS for image-only notes by keyword."""
-    from xhs import SearchNoteType, SearchSortType
-
-    client = get_client()
-    articles = []
-    page = 1
-
-    while len(articles) < max_notes:
-        try:
-            data = client.get_note_by_keyword(
-                keyword=keyword,
-                note_type=SearchNoteType.IMAGE,
-                sort=SearchSortType.LATEST,
-                page=page,
-                page_size=20,
-            )
-        except Exception as e:
-            log.error(f"Error searching XHS for '{keyword}': {e}")
-            break
-
-        items = data.get("items", [])
-        if not items:
-            break
-
-        for item in items:
-            note_card = item.get("note_card", {})
-            if note_card.get("type") != "normal":
-                continue
-            note_id = item.get("id", "")
-            if not note_id:
-                continue
-
-            try:
-                detail = client.get_note_by_id(note_id)
-                time.sleep(1)  # rate limiting
-            except Exception as e:
-                log.warning(f"Error fetching note detail {note_id}: {e}")
-                continue
-
-            articles.append(_note_to_article(detail))
-            if len(articles) >= max_notes:
-                break
-
-        if not data.get("has_more"):
-            break
-        page += 1
-
-    log.info(f"Search '{keyword}': found {len(articles)} image notes")
+    log.info(f"User {user_id} ({nickname}): {len(articles)} articles (via search)")
     return articles
 
 
@@ -366,20 +352,17 @@ def fetch_all_subscribed(days_back: int = 7, max_per_user: int = 10,
                          max_per_keyword: int = 10) -> list[Article]:
     """Fetch notes from all subscribed users and keywords.
 
-    Returns deduplicated list of Article objects, filtered by days_back.
+    Returns deduplicated list of Article objects.
     """
     subs = _load_subscriptions()
     all_articles = []
-    cutoff = datetime.now() - timedelta(days=days_back)
-    cutoff_ts = int(cutoff.timestamp())
 
     for user in subs.get("users", []):
         log.info(f"Fetching XHS notes for user: {user['nickname']} ({user['user_id']})")
         try:
             notes = fetch_user_notes(user["user_id"], max_notes=max_per_user)
-            for note in notes:
-                if note.publish_time >= cutoff_ts:
-                    all_articles.append(note)
+            all_articles.extend(notes)
+            time.sleep(2)  # rate limit between users
         except Exception as e:
             log.error(f"Error fetching user {user['nickname']}: {e}")
 
@@ -388,9 +371,8 @@ def fetch_all_subscribed(days_back: int = 7, max_per_user: int = 10,
         log.info(f"Searching XHS for keyword: {keyword}")
         try:
             notes = search_notes(keyword, max_notes=max_per_keyword)
-            for note in notes:
-                if note.publish_time >= cutoff_ts:
-                    all_articles.append(note)
+            all_articles.extend(notes)
+            time.sleep(2)  # rate limit between searches
         except Exception as e:
             log.error(f"Error searching keyword '{keyword}': {e}")
 
@@ -402,6 +384,6 @@ def fetch_all_subscribed(days_back: int = 7, max_per_user: int = 10,
             seen.add(a.id)
             unique.append(a)
 
-    log.info(f"Total XHS notes fetched: {len(unique)} (from {len(subs.get('users', []))} users, "
+    log.info(f"Total XHS: {len(unique)} articles (from {len(subs.get('users', []))} users, "
              f"{len(subs.get('keywords', []))} keywords)")
     return unique

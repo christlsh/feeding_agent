@@ -24,7 +24,7 @@ ANTHROPIC_BASE_URL = os.environ.get("ANTHROPIC_BASE_URL", "https://claudelike.on
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_AUTH_TOKEN", "cr_3050ca27e7cd779458bc8e0dcaad560b449d452b3c3e67c33a2a8499606d13be")
 
 # XHS (Xiaohongshu)
-XHS_COOKIE = os.environ.get("XHS_COOKIE", "")
+XHS_COOKIE = os.environ.get("XHS_COOKIE", "acw_tc=0a00d1a617722597452506280e6b4dda234feecc1b8186ee187868d5a945a1;abRequestId=086f0244-ab20-50f4-acc5-abdc638db9a6;webBuild=5.13.0;xsecappid=xhs-pc-web;a1=19ca2e9a08f1vugn2gnwy06abmpain86gjmsprdgh30000251000;webId=027b2dd61a8cf52912452ddd52421aba;websectiga=f3d8eaee8a8c63016320d94a1bd00562d516a5417bc43a032a80cbf70f07d5c0;sec_poison_id=5971ca90-f7ae-4b11-8b47-ae3a5a05c685;gid=yjS0Jdj0fJkqyjS0Jdj08VFfYiyh7kIJkIEv6kx8K0D6UMq803IYKU888J2y8888Ji4SY02f;web_session=040069b02d7a895bad59dec1973b4b10c87abd")
 XHS_SIGN_SERVER = os.environ.get("XHS_SIGN_SERVER", "http://localhost:5005/sign")
 
 # Data paths (A-share)
