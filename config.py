@@ -23,6 +23,10 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8798729634:AAHAqqrRN1
 ANTHROPIC_BASE_URL = os.environ.get("ANTHROPIC_BASE_URL", "https://claudelike.online/api")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_AUTH_TOKEN", "cr_3050ca27e7cd779458bc8e0dcaad560b449d452b3c3e67c33a2a8499606d13be")
 
+# XHS (Xiaohongshu)
+XHS_COOKIE = os.environ.get("XHS_COOKIE", "")
+XHS_SIGN_SERVER = os.environ.get("XHS_SIGN_SERVER", "http://localhost:5005/sign")
+
 # Data paths (A-share)
 DATA_ROOT = "/data/a_share/sihang"
 L2_OB_DIR = f"{DATA_ROOT}/l2_ob_full_universe_with_info"
@@ -38,6 +42,8 @@ TRADE_DAYS_PATH = f"{DATA_ROOT}/all_trade_days.npy"
 # Project paths
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(PROJECT_ROOT, "results")
+
+XHS_SUBSCRIPTIONS_FILE = os.path.join(PROJECT_ROOT, ".xhs_subscriptions.json")
 
 # Python interpreter with polars
 PYTHON = "/home/sihang/anaconda3/bin/python"

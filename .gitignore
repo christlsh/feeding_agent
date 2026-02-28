@@ -5,4 +5,5 @@ __pycache__/
 .env
 .processed.json
 .telegram_chat_ids.json
+.xhs_subscriptions.json
 logs/
